@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>실시간 번역</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding-bottom: 100px;
+        }
+
+        #recordButton {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            border: 2px solid #000;
+            background-color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        #recordButton.recording {
+            background-color: #ff4d4d;
+        }
+
+        #recordButton svg {
+            padding-top: 5px;
+            width: 40px;
+            height: 40px;
+        }
+
+        #microphoneSelect {
+            position: fixed;
+            bottom: 130px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: none;
+            border: none;
+            font-size: 16px;
+            appearance: none;
+            -moz-appearance: none;
+            -webkit-appearance: none;
+            text-align: center;
+            cursor: pointer;
+        }
+
+        #microphoneSelect option {
+            color: #000;
+        }
+
+        #microphoneSelect::-ms-expand {
+            display: none;
+        }
+
+        #textDisplay {
+            position: fixed;
+            bottom: 160px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            text-align: center;
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 12px;
+            color: #555;
+            padding: 5px;
+            border-radius: 5px;
+            word-break: break-word;
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400&display=swap" rel="stylesheet">
+</head>
+<body>
+<div id="recordButton">
+    <svg id="micIcon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        <path fill="#000000"
+              d="M12,14A3,3 0 0,0 15,11V5A3,3 0 0,0 12,2A3,3 0 0,0 9,5V11A3,3 0 0,0 12,14M19,11V10H17V11A5,5 0 0,1 7,11V10H5V11A7,7 0 0,0 12,18A7,7 0 0,0 19,11Z"/>
+    </svg>
+</div>
+<div id="textDisplay"></div>
+<select id="microphoneSelect"></select>
+
+<script>
+    let audioContext;
+    let processor;
+    let input;
+    let globalStream;
+
+    let websocket;
+
+    let isRecording = false;
+
+    let audioQueue = [];
+    let isPlaying = false;
+
+    const recordButton = document.getElementById("recordButton");
+    const micIcon = document.getElementById("micIcon");
+    const microphoneSelect = document.getElementById("microphoneSelect");
+    const textDisplay = document.getElementById("textDisplay");
+
+    recordButton.onclick = () => {
+        if (isRecording) {
+            stopRecording();
+        } else {
+            startRecording();
+        }
+    };
+
+    function startRecording() {
+        if (isRecording) return;
+        isRecording = true;
+        recordButton.classList.add("recording");
+        micIcon.style.display = "none";
+        createRecordingIndicator();
+
+        initWebSocket();
+        initAudio();
+    }
+
+    function stopRecording() {
+        if (!isRecording) return;
+        isRecording = false;
+        recordButton.classList.remove("recording");
+        micIcon.style.display = "block";
+        removeRecordingIndicator();
+
+        if (processor) processor.disconnect();
+        if (input) input.disconnect();
+        if (audioContext && audioContext.state !== 'closed') audioContext.close();
+        if (websocket && websocket.readyState === WebSocket.OPEN) websocket.close();
+        if (globalStream) {
+            globalStream.getTracks().forEach(track => track.stop());
+        }
+        audioQueue = [];
+        isPlaying = false;
+    }
+
+    function createRecordingIndicator() {
+        const indicator = document.createElement("div");
+        indicator.id = "recordingIndicator";
+        indicator.style.width = "20px";
+        indicator.style.height = "20px";
+        indicator.style.backgroundColor = "#fff";
+        indicator.style.border = "2px solid #000";
+        indicator.style.boxSizing = "border-box";
+        recordButton.appendChild(indicator);
+    }
+
+    function removeRecordingIndicator() {
+        const indicator = document.getElementById("recordingIndicator");
+        if (indicator) {
+            recordButton.removeChild(indicator);
+        }
+    }
+
+    async function initAudio() {
+        try {
+            const selectedDeviceId = microphoneSelect.value;
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    deviceId: selectedDeviceId ? {exact: selectedDeviceId} : undefined
+                },
+                video: false
+            });
+            globalStream = stream;
+            input = audioContext.createMediaStreamSource(stream);
+
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            processor.onaudioprocess = function (e) {
+                const inputData = e.inputBuffer.getChannelData(0);
+                const downsampledBuffer = downsampleBuffer(inputData, audioContext.sampleRate, 16000);
+                if (websocket && websocket.readyState === WebSocket.OPEN && downsampledBuffer) {
+                    websocket.send(downsampledBuffer);
+                }
+            };
+
+            input.connect(processor);
+            processor.connect(audioContext.destination);
+        } catch (error) {
+            console.error("오디오 초기화 중 오류 발생: ", error);
+            alert("마이크 권한이 필요합니다. 브라우저 설정을 확인하세요.");
+        }
+    }
+
+    function downsampleBuffer(buffer, sampleRate, outSampleRate) {
+        if (outSampleRate >= sampleRate) {
+            console.warn("다운샘플링 레이트는 원본 샘플레이트보다 낮아야 합니다.");
+            return null;
+        }
+        const sampleRateRatio = sampleRate / outSampleRate;
+        const newLength = Math.round(buffer.length / sampleRateRatio);
+        const result = new Int16Array(newLength);
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+        while (offsetResult < result.length) {
+            const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+            let accum = 0, count = 0;
+            for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                accum += buffer[i];
+                count++;
+            }
+            result[offsetResult] = Math.min(1, accum / count) * 0x7FFF;
+            offsetResult++;
+            offsetBuffer = nextOffsetBuffer;
+        }
+        return result.buffer;
+    }
+
+    function initWebSocket() {
+        websocket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/media-stream');
+        websocket.binaryType = 'arraybuffer';
+
+        websocket.onopen = function () {
+            console.log('WebSocket connection opened');
+        };
+
+        websocket.onmessage = function (event) {
+            if (typeof event.data === 'string') {
+                // 텍스트 메시지 처리
+                appendTextToDisplay(event.data);
+            } else {
+                // 음성 메시지 처리
+                audioQueue.push(event.data);
+                if (!isPlaying) {
+                    playAudioQueue();
+                }
+            }
+        };
+
+        websocket.onclose = function () {
+            console.log('WebSocket connection closed');
+        };
+
+        websocket.onerror = function (error) {
+            console.error('WebSocket error:', error);
+        };
+    }
+
+    function appendTextToDisplay(text) {
+        const p = document.createElement('p');
+        p.innerText = text;
+        p.style.margin = "5px 0";
+        textDisplay.appendChild(p);
+    }
+
+    function playAudioQueue() {
+        if (audioQueue.length === 0) {
+            isPlaying = false;
+            return;
+        }
+        isPlaying = true;
+
+        const arrayBuffer = audioQueue.shift();
+        const audioBuffer = new Int16Array(arrayBuffer);
+        const float32Buffer = new Float32Array(audioBuffer.length);
+        for (let i = 0; i < audioBuffer.length; i++) {
+            float32Buffer[i] = audioBuffer[i] / 0x7FFF;
+        }
+
+        const buffer = audioContext.createBuffer(1, float32Buffer.length, 24000);
+        buffer.getChannelData(0).set(float32Buffer);
+
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+        source.onended = function () {
+            playAudioQueue();
+        };
+        source.start();
+    }
+
+    async function getMicrophoneDevices() {
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const mics = devices.filter(device => device.kind === 'audioinput');
+            microphoneSelect.innerHTML = '';
+            mics.forEach(mic => {
+                const option = document.createElement('option');
+                option.value = mic.deviceId;
+                option.text = mic.label || `Microphone ${microphoneSelect.length + 1}`;
+                microphoneSelect.appendChild(option);
+            });
+        } catch (error) {
+            console.error("마이크 장치 목록을 가져오는 중 오류 발생: ", error);
+        }
+    }
+
+    window.onload = () => {
+        getMicrophoneDevices();
+    };
+    navigator.mediaDevices.addEventListener('devicechange', getMicrophoneDevices);
+</script>
+</body>
+</html>
